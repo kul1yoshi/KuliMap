@@ -15,8 +15,7 @@ KuliMap.exe <target process name> <path to dll>
 ```
 
 ## Security Note
-KuliMap is designed for educational purposes and security research. By avoiding `CreateRemoteThread` in favor of more advanced techniques like *Thread Hijacking*, it significantly reduces the detection surface against basic usermode anti-cheats.
-
+KuliMap is designed for educational purposes and security research.
 ---
 
 ## Disclaimer
