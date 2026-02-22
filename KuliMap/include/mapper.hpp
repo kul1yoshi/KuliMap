@@ -153,8 +153,7 @@ MapResult MapDll(HANDLE hProcess, std::span<const std::byte> dllBytes) {
         .reservedParam = nullptr
     };
 
-    if (!WriteProcessMemory(hProcess, pTargetBase.get(), dllBytes.data(), pNtHeader->OptionalHeader.SizeOfHeaders, nullptr))
-        return std::unexpected("Failed to write headers");
+    if (!WriteProcessMemory(hProcess, pTargetBase.get(), dllBytes.data(), pNtHeader->OptionalHeader.SizeOfHeaders, nullptr)) return std::unexpected("Failed to write headers");
 
     auto* pSectionHeader = IMAGE_FIRST_SECTION(pNtHeader);
     for (int i = 0; i < pNtHeader->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
@@ -176,9 +175,11 @@ MapResult MapDll(HANDLE hProcess, std::span<const std::byte> dllBytes) {
     if (!hThread) return std::unexpected("Failed to create remote thread");
 
     HINSTANCE hCheck = nullptr;
+    DWORD exitCode = 0;
     while (!hCheck) {
+        if (!GetExitCodeThread(hThread.get(), &exitCode) || exitCode != STILL_ACTIVE) return std::unexpected("Remote thread terminated unexpectedly with code: " + std::to_string(exitCode));
         MAPPING_DATA dataRead;
-        ReadProcessMemory(hProcess, pDataMem.get(), &dataRead, sizeof(MAPPING_DATA), nullptr);
+        if (!ReadProcessMemory(hProcess, pDataMem.get(), &dataRead, sizeof(MAPPING_DATA), nullptr)) return std::unexpected("Failed to read mapping data");
         hCheck = dataRead.hModule;
         Sleep(10);
     }
@@ -190,3 +191,4 @@ MapResult MapDll(HANDLE hProcess, std::span<const std::byte> dllBytes) {
 
     return {};
 }
+
