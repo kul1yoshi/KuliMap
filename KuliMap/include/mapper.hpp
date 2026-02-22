@@ -1,4 +1,5 @@
-#include <windows.h>
+#pragma once
+#include <Windows.h>
 #include <iostream>
 #include <vector>
 #include <expected>
@@ -6,6 +7,8 @@
 #include <string_view>
 #include <span>
 #include <array>
+#include <memory>
+#include <bit>
 
 using f_LoadLibraryA = HINSTANCE(WINAPI*)(const char* lpLibFilename);
 using f_GetProcAddress = FARPROC(WINAPI*)(HMODULE hModule, LPCSTR lpProcName);
@@ -25,183 +28,165 @@ struct MAPPING_DATA {
 #pragma optimize("", off)
 #pragma runtime_checks("", off)
 #pragma code_seg(".shell")
-void __stdcall Shellcode(MAPPING_DATA* pData) {
-    auto* pBase = reinterpret_cast<uint8_t*>(pData->pBase);
-    auto* pDosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(pBase);
-    auto* pOldNtHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + pDosHeader->e_lfanew);
-    auto* pOptHeader = &pOldNtHeader->OptionalHeader;
+extern "C" void __stdcall Shellcode(MAPPING_DATA* pData) {
+    if (!pData) return;
+
+    auto* pBase = pData->pBase;
+    auto* pDosHeader = std::bit_cast<IMAGE_DOS_HEADER*>(pBase);
+    auto* pNtHeader = std::bit_cast<IMAGE_NT_HEADERS*>(pBase + pDosHeader->e_lfanew);
+    auto* pOptHeader = &pNtHeader->OptionalHeader;
 
     auto _LoadLibraryA = pData->pLoadLibraryA;
     auto _GetProcAddress = pData->pGetProcAddress;
     auto _RtlAddFunctionTable = pData->pRtlAddFunctionTable;
-    auto _DllMain = reinterpret_cast<f_DllEntryPoint>(pBase + pOptHeader->AddressOfEntryPoint);
 
-    bool _ExceptionSupportFailed = false;
+    auto delta = std::bit_cast<uintptr_t>(pBase) - pOptHeader->ImageBase;
+    if (delta) {
+        auto* pRelocDir = &pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (pRelocDir->Size) {
+            auto* pRelocData = std::bit_cast<IMAGE_BASE_RELOCATION*>(pBase + pRelocDir->VirtualAddress);
+            while (pRelocData->VirtualAddress) {
+                uint32_t entriesCount = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(uint16_t);
+                uint16_t* pRelativeInfo = std::bit_cast<uint16_t*>(pRelocData + 1);
 
-    uint8_t* LocationDelta = pBase - pOptHeader->ImageBase;
-    if (LocationDelta && pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) {
-        auto* pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-        const auto* pRelocEnd = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uintptr_t>(pRelocData) + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size);
-
-        while (pRelocData < pRelocEnd && pRelocData->SizeOfBlock) {
-            uint32_t amountOfEntries = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(uint16_t);
-            uint16_t* pRelativeInfo = reinterpret_cast<uint16_t*>(pRelocData + 1);
-
-            for (uint32_t i = 0; i != amountOfEntries; ++i, ++pRelativeInfo) {
-                if ((*pRelativeInfo >> 12) == IMAGE_REL_BASED_DIR64) {
-                    auto* pPatch = reinterpret_cast<uintptr_t*>(pBase + pRelocData->VirtualAddress + ((*pRelativeInfo) & 0xFFF));
-                    *pPatch += reinterpret_cast<uintptr_t>(LocationDelta);
+                for (uint32_t i = 0; i < entriesCount; ++i) {
+                    if ((pRelativeInfo[i] >> 12) == IMAGE_REL_BASED_DIR64) {
+                        auto* pPatch = std::bit_cast<uintptr_t*>(pBase + pRelocData->VirtualAddress + (pRelativeInfo[i] & 0xFFF));
+                        *pPatch += delta;
+                    }
                 }
+
+                pRelocData = std::bit_cast<IMAGE_BASE_RELOCATION*>(std::bit_cast<std::byte*>(pRelocData) + pRelocData->SizeOfBlock);
             }
-            pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uint8_t*>(pRelocData) + pRelocData->SizeOfBlock);
         }
     }
 
-    if (pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
-        auto* pImportDesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+    auto* pImportDir = &pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (pImportDir->Size) {
+        auto* pImportDesc = std::bit_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pImportDir->VirtualAddress);
         while (pImportDesc->Name) {
-            char* szMod = reinterpret_cast<char*>(pBase + pImportDesc->Name);
-            HINSTANCE hDll = _LoadLibraryA(szMod);
+            HINSTANCE hDll = _LoadLibraryA(std::bit_cast<char*>(pBase + pImportDesc->Name));
+            if (hDll) {
+                auto* pThunkRef = std::bit_cast<uintptr_t*>(pBase + (pImportDesc->OriginalFirstThunk ? pImportDesc->OriginalFirstThunk : pImportDesc->FirstThunk));
+                auto* pFuncRef = std::bit_cast<uintptr_t*>(pBase + pImportDesc->FirstThunk);
 
-            auto* pThunkRef = reinterpret_cast<uintptr_t*>(pBase + (pImportDesc->OriginalFirstThunk ? pImportDesc->OriginalFirstThunk : pImportDesc->FirstThunk));
-            auto* pFuncRef = reinterpret_cast<uintptr_t*>(pBase + pImportDesc->FirstThunk);
-
-            for (; *pThunkRef; ++pThunkRef, ++pFuncRef) {
-                if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef)) {
-                    *pFuncRef = reinterpret_cast<uintptr_t>(_GetProcAddress(hDll, reinterpret_cast<char*>(*pThunkRef & 0xFFFF)));
-                } else {
-                    auto* pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + (*pThunkRef));
-                    *pFuncRef = reinterpret_cast<uintptr_t>(_GetProcAddress(hDll, pImport->Name));
+                for (; *pThunkRef; ++pThunkRef, ++pFuncRef) {
+                    if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef)) {
+                        *pFuncRef = std::bit_cast<uintptr_t>(_GetProcAddress(hDll, std::bit_cast<char*>(*pThunkRef & 0xFFFF)));
+                    }
+                    else {
+                        auto* pImport = std::bit_cast<IMAGE_IMPORT_BY_NAME*>(pBase + (*pThunkRef));
+                        *pFuncRef = std::bit_cast<uintptr_t>(_GetProcAddress(hDll, pImport->Name));
+                    }
                 }
             }
             ++pImportDesc;
         }
     }
 
-    if (pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) {
-        auto* pTls = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-        auto* pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTls->AddressOfCallBacks);
+    auto* pTlsDir = &pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (pTlsDir->Size) {
+        auto* pTls = std::bit_cast<IMAGE_TLS_DIRECTORY*>(pBase + pTlsDir->VirtualAddress);
+        auto* pCallback = std::bit_cast<PIMAGE_TLS_CALLBACK*>(pTls->AddressOfCallBacks);
         for (; pCallback && *pCallback; ++pCallback) {
             (*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
         }
     }
 
-    const auto& entryExcept = pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-    if (entryExcept.Size) {
-        if (!_RtlAddFunctionTable(reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(pBase + entryExcept.VirtualAddress), entryExcept.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), reinterpret_cast<DWORD64>(pBase))) {
-            _ExceptionSupportFailed = true;
-        }
+    auto* pExceptDir = &pOptHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (pExceptDir->Size && _RtlAddFunctionTable) {
+        auto* pFuncEntry = std::bit_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(pBase + pExceptDir->VirtualAddress);
+        DWORD count = pExceptDir->Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+        _RtlAddFunctionTable(pFuncEntry, count, std::bit_cast<DWORD64>(pBase));
     }
 
-    _DllMain(pBase, pData->fdwReasonParam, pData->reservedParam);
+    if (pOptHeader->AddressOfEntryPoint) {
+        auto _DllMain = std::bit_cast<f_DllEntryPoint>(pBase + pOptHeader->AddressOfEntryPoint);
+        _DllMain(pBase, pData->fdwReasonParam, pData->reservedParam);
+    }
 
-    pData->hModule = _ExceptionSupportFailed ? reinterpret_cast<HINSTANCE>(0x505050) : reinterpret_cast<HINSTANCE>(pBase);
+    pData->hModule = std::bit_cast<HINSTANCE>(pBase);
 }
-
-void __stdcall ShellcodeEnd() {}
+extern "C" void __stdcall ShellcodeEnd() {}
 #pragma code_seg()
 #pragma comment(linker, "/SECTION:.shell,ERW")
 #pragma runtime_checks("", restore)
 #pragma optimize("", on)
 
-using MapResult = std::expected<bool, std::string>;
+struct HandleDeleter {
+    void operator()(HANDLE h) const {
+        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+};
+struct RemoteMemDeleter {
+    HANDLE hProcess;
+    void operator()(void* ptr) const {
+        if (ptr) VirtualFreeEx(hProcess, ptr, 0, MEM_RELEASE);
+    }
+};
+using MapResult = std::expected<void, std::string>;
+using UniqueHandle = std::unique_ptr<void, HandleDeleter>;
+using UniqueRemoteMem = std::unique_ptr<void, RemoteMemDeleter>;
 
 MapResult MapDll(HANDLE hProcess, std::span<const std::byte> dllBytes) {
-    if (dllBytes.empty()) return std::unexpected("Empty DLL buffer");
+    if (dllBytes.empty()) return std::unexpected("DLL buffer is empty");
 
-    const auto* pDosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(dllBytes.data());
-    const auto* pOldNtHeader = reinterpret_cast<const IMAGE_NT_HEADERS*>(dllBytes.data() + pDosHeader->e_lfanew);
-    const auto* pOldOptHeader = &pOldNtHeader->OptionalHeader;
-    const auto* pOldFileHeader = &pOldNtHeader->FileHeader;
+    auto* pDosHeader = std::bit_cast<const IMAGE_DOS_HEADER*>(dllBytes.data());
+    if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) return std::unexpected("Invalid DOS signature");
 
-    if (pOldFileHeader->Machine != IMAGE_FILE_MACHINE_AMD64) {
-        return std::unexpected("Invalid platform! Only x64 is supported.");
-    }
+    auto* pNtHeader = std::bit_cast<const IMAGE_NT_HEADERS*>(dllBytes.data() + pDosHeader->e_lfanew);
+    if (pNtHeader->Signature != IMAGE_NT_SIGNATURE) return std::unexpected("Invalid NT signature");
 
-    auto* pTargetBase = static_cast<std::byte*>(VirtualAllocEx(hProcess, nullptr, pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!pTargetBase) {
-        return std::unexpected("Target process memory allocation failed!");
-    }
+    if (pNtHeader->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return std::unexpected("Only x64 DLLs are supported");
 
-    DWORD oldProtect = 0;
-    VirtualProtectEx(hProcess, pTargetBase, pOldOptHeader->SizeOfImage, PAGE_EXECUTE_READWRITE, &oldProtect);
+    void* pTargetBaseRaw = VirtualAllocEx(hProcess, nullptr, pNtHeader->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pTargetBaseRaw) return std::unexpected("Failed to allocate memory in target process");
 
-    MAPPING_DATA data {
+    UniqueRemoteMem pTargetBase(pTargetBaseRaw, RemoteMemDeleter{ hProcess });
+
+    MAPPING_DATA data{
         .pLoadLibraryA = LoadLibraryA,
         .pGetProcAddress = GetProcAddress,
-        .pRtlAddFunctionTable = reinterpret_cast<f_RtlAddFunctionTable>(RtlAddFunctionTable),
-        .pBase = pTargetBase,
+        .pRtlAddFunctionTable = std::bit_cast<f_RtlAddFunctionTable>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlAddFunctionTable")),
+        .pBase = static_cast<std::byte*>(pTargetBase.get()),
         .fdwReasonParam = DLL_PROCESS_ATTACH,
         .reservedParam = nullptr
     };
 
-    if (!WriteProcessMemory(hProcess, pTargetBase, dllBytes.data(), 0x1000, nullptr)) {
-        VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-        return std::unexpected("Failed to write PE header!");
-    }
+    if (!WriteProcessMemory(hProcess, pTargetBase.get(), dllBytes.data(), pNtHeader->OptionalHeader.SizeOfHeaders, nullptr))
+        return std::unexpected("Failed to write headers");
 
-    auto* pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
-    for (UINT i = 0; i != pOldFileHeader->NumberOfSections; ++i, ++pSectionHeader) {
+    auto* pSectionHeader = IMAGE_FIRST_SECTION(pNtHeader);
+    for (int i = 0; i < pNtHeader->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
         if (pSectionHeader->SizeOfRawData) {
-            if (!WriteProcessMemory(hProcess, pTargetBase + pSectionHeader->VirtualAddress, dllBytes.data() + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr)) {
-                VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-                return std::unexpected("Failed to map sections!");
-            }
+            if (!WriteProcessMemory(hProcess, static_cast<std::byte*>(pTargetBase.get()) + pSectionHeader->VirtualAddress, dllBytes.data() + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr)) return std::unexpected("Failed to write section: " + std::string(reinterpret_cast<const char*>(pSectionHeader->Name)));
         }
     }
 
-    auto* MappingDataAlloc = static_cast<std::byte*>(VirtualAllocEx(hProcess, nullptr, sizeof(MAPPING_DATA), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!MappingDataAlloc || !WriteProcessMemory(hProcess, MappingDataAlloc, &data, sizeof(MAPPING_DATA), nullptr)) {
-        VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
-        return std::unexpected("Failed to write mapping data!");
-    }
+    void* pDataMemRaw = VirtualAllocEx(hProcess, nullptr, sizeof(MAPPING_DATA), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    UniqueRemoteMem pDataMem(pDataMemRaw, RemoteMemDeleter{ hProcess });
+    WriteProcessMemory(hProcess, pDataMem.get(), &data, sizeof(MAPPING_DATA), nullptr);
 
     const size_t shellcodeSize = reinterpret_cast<uintptr_t>(ShellcodeEnd) - reinterpret_cast<uintptr_t>(Shellcode);
-    
-    auto* pShellcode = VirtualAllocEx(hProcess, nullptr, shellcodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!pShellcode || !WriteProcessMemory(hProcess, pShellcode, reinterpret_cast<LPCVOID>(Shellcode), shellcodeSize, nullptr)) {
-        return std::unexpected("Failed to allocate or write shellcode!");
+    void* pShellcodeMemRaw = VirtualAllocEx(hProcess, nullptr, shellcodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    UniqueRemoteMem pShellcodeMem(pShellcodeMemRaw, RemoteMemDeleter{ hProcess });
+    WriteProcessMemory(hProcess, pShellcodeMem.get(), reinterpret_cast<const void*>(Shellcode), shellcodeSize, nullptr);
+
+    UniqueHandle hThread(CreateRemoteThread(hProcess, nullptr, 0, std::bit_cast<LPTHREAD_START_ROUTINE>(pShellcodeMem.get()), pDataMem.get(), 0, nullptr));
+    if (!hThread) return std::unexpected("Failed to create remote thread");
+
+    HINSTANCE hCheck = nullptr;
+    while (!hCheck) {
+        MAPPING_DATA dataRead;
+        ReadProcessMemory(hProcess, pDataMem.get(), &dataRead, sizeof(MAPPING_DATA), nullptr);
+        hCheck = dataRead.hModule;
+        Sleep(10);
     }
 
-    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellcode), MappingDataAlloc, 0, nullptr);
-    if (!hThread) {
-        return std::unexpected("Thread creation failed!");
-    }
-    CloseHandle(hThread);
+    std::vector<std::byte> zeroHeader(pNtHeader->OptionalHeader.SizeOfHeaders, std::byte{ 0 });
+    WriteProcessMemory(hProcess, pTargetBase.get(), zeroHeader.data(), zeroHeader.size(), nullptr);
 
-    HINSTANCE hChecked = nullptr;
-    while (!hChecked) {
-        DWORD exitCode = 0;
-        GetExitCodeProcess(hProcess, &exitCode);
-        if (exitCode != STILL_ACTIVE) return std::unexpected("Process crashed!");
+    pTargetBase.release();
 
-        MAPPING_DATA dataChecked{};
-        ReadProcessMemory(hProcess, MappingDataAlloc, &dataChecked, sizeof(dataChecked), nullptr);
-        hChecked = dataChecked.hModule;
-
-        if (hChecked == reinterpret_cast<HINSTANCE>(0x404040)) return std::unexpected("Wrong mapping ptr!");
-        if (hChecked == reinterpret_cast<HINSTANCE>(0x505050)) return std::unexpected("Exception support failed!");
-
-        Sleep(5);
-    }
-
-    std::array<std::byte, 0x1000> emptyBuffer{};
-    WriteProcessMemory(hProcess, pTargetBase, emptyBuffer.data(), 0x1000, nullptr);
-
-    pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
-    for (UINT i = 0; i != pOldFileHeader->NumberOfSections; ++i, ++pSectionHeader) {
-        if (pSectionHeader->Misc.VirtualSize) {
-            DWORD newProtect = PAGE_READONLY;
-            if (pSectionHeader->Characteristics & IMAGE_SCN_MEM_WRITE) newProtect = PAGE_READWRITE;
-            else if (pSectionHeader->Characteristics & IMAGE_SCN_MEM_EXECUTE) newProtect = PAGE_EXECUTE_READ;
-
-            VirtualProtectEx(hProcess, pTargetBase + pSectionHeader->VirtualAddress, pSectionHeader->Misc.VirtualSize, newProtect, &oldProtect);
-        }
-    }
-
-    WriteProcessMemory(hProcess, pShellcode, emptyBuffer.data(), shellcodeSize, nullptr);
-    VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
-    VirtualFreeEx(hProcess, MappingDataAlloc, 0, MEM_RELEASE);
-
-    return true;
+    return {};
 }
