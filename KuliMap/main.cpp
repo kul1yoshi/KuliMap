@@ -1,16 +1,17 @@
-﻿#include <Windows.h>
+#include <Windows.h>
 #include <filesystem>
 #include <fstream>
-#include <print>
+#include <iostream>
 #include <mapper.hpp>
-#include <tlhelp32.h>
+#include <TlHelp32.h>
 #include <string_view>
+#include <vector>
 
 DWORD GetProcessIdByName(std::wstring_view processName) {
     DWORD pid = 0;
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
-        std::println("[-] Failed to create snapshot. Error: {}", GetLastError());
+        std::cerr << "[-] Failed to create snapshot. Error: " << GetLastError() << std::endl;
         return 0;
     }
 
@@ -29,47 +30,54 @@ DWORD GetProcessIdByName(std::wstring_view processName) {
     CloseHandle(snapshot);
     return pid;
 }
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::println("Usage: injector.exe <process name> <dll path>");
+        std::cout << "Usage: " << std::filesystem::path(argv[0]).filename().string() << " <process name> <dll path>" << std::endl;
         return 1;
     }
 
     std::string_view processName = argv[1];
     std::filesystem::path dllPath = argv[2];
 
+    if (!std::filesystem::exists(dllPath)) {
+        std::cerr << "[-] DLL file does not exist: " << dllPath.string() << std::endl;
+        return 1;
+    }
+
     std::ifstream file(dllPath, std::ios::binary | std::ios::ate);
     if (!file) {
-        std::println("[-] Failed to open DLL: {}", dllPath.string());
+        std::cerr << "[-] Failed to open DLL: " << dllPath.string() << std::endl;
         return 1;
     }
 
     auto fileSize = file.tellg();
-    std::vector<std::byte> buffer(fileSize);
+    std::vector<std::byte> buffer(static_cast<size_t>(fileSize));
     file.seekg(0, std::ios::beg);
     file.read(reinterpret_cast<char*>(buffer.data()), fileSize);
     file.close();
 
-    DWORD pid = GetProcessIdByName(std::wstring(processName.begin(), processName.end()).c_str());
+    std::wstring wProcessName(processName.begin(), processName.end());
+    DWORD pid = GetProcessIdByName(wProcessName);
     if (!pid) {
-        std::println("[-] Process {} not found.", processName);
+        std::cerr << "[-] Process " << processName << " not found." << std::endl;
         return 1;
     }
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProc) {
-        std::println("[-] OpenProcess failed. Run as Admin!");
+        std::cerr << "[-] OpenProcess failed. Run as Admin! Error: " << GetLastError() << std::endl;
         return 1;
     }
 
-    std::println("[*] Injecting {} into {}...", dllPath.filename().string(), processName);
+    std::cout << "[*] Injecting " << dllPath.filename().string() << " into " << processName << " (PID: " << pid << ")..." << std::endl;
 
     auto result = MapDll(hProc, buffer);
     if (result) {
-        std::println("[+] Successfully mapped!");
+        std::cout << "[+] Successfully mapped!" << std::endl;
     }
     else {
-        std::println("[-] Mapping failed: {}", result.error());
+        std::cerr << "[-] Mapping failed: " << result.error() << std::endl;
     }
 
     CloseHandle(hProc);
